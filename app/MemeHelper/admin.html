@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Аналитика — Meme Helper</title>
+  <link rel="icon" type="image/png" href="images/favicon.png">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="admin.css">
+</head>
+<body class="admin-page">
+  <header class="admin-top">
+    <a class="logo" href="index.html"><span class="logo__sticker">Meme Helper</span></a>
+    <span class="admin-top__title">Аналитика</span>
+    <div class="admin-top__right">
+      <a class="admin-top__back" href="index.html">← В чат</a>
+      <!-- Аватар и никнейм админа (рисует js/admin.js) -->
+      <div id="admin-user"></div>
+    </div>
+  </header>
+
+  <!-- Содержимое рисует js/admin.js: загрузка, ошибка, нет доступа или сами данные -->
+  <main class="admin" id="admin"></main>
+
+  <script src="js/data.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/admin-api.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/admin.js"></script>
+</body>
+</html>
