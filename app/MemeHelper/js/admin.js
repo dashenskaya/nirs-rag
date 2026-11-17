@@ -237,9 +237,11 @@ async function changePeriod(next) {
 
 async function deleteQuery(id, button) {
   button.disabled = true;
-  await adminApi.deleteEmptyQuery(id);
-  document.getElementById('queries').innerHTML = emptyQueriesCard(await adminApi.getEmptyQueries());
-  showToast('Запись удалена');
+  try {
+    await adminApi.deleteEmptyQuery(id);
+    document.getElementById('queries').innerHTML = emptyQueriesCard(await adminApi.getEmptyQueries());
+    showToast('Запись удалена');
+  } catch (error) { button.disabled = false; showToast(error.message); }
 }
 
 adminBox.addEventListener('click', (event) => {
@@ -273,7 +275,9 @@ adminBox.addEventListener('mouseout', (event) => {
 
 // ===== Запуск =====
 (async () => {
-  const user = await api.getCurrentUser();
+  let user;
+  try { user = await api.getCurrentUser(); }
+  catch (error) { renderError(); return; }
   if (user) {
     document.getElementById('admin-user').innerHTML = `
       <span class="admin-user">${avatarHtml(user)}<span>${escapeHtml(user.nickname)}</span></span>`;

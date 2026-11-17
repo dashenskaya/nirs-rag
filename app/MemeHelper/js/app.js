@@ -9,9 +9,16 @@ const state = {
 };
 
 (async () => {
-  state.user = await api.getCurrentUser();
-  renderProfile();
-  renderSidebar();
-  renderChat();
-  input.focus();
+  try {
+    const [user, health] = await Promise.all([api.getCurrentUser(), api.health()]);
+    state.user = user;
+    document.getElementById('search-mode').hidden = health.searchMode !== 'demo';
+    renderProfile();
+    await renderSidebar();
+    renderChat();
+    input.focus();
+  } catch (error) {
+    messagesBox.textContent = error.message;
+    input.disabled = sendButton.disabled = true;
+  }
 })();

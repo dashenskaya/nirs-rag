@@ -32,6 +32,7 @@
       </header>
 
       <section class="chat" id="chat">
+        <p class="search-mode" id="search-mode" hidden>Проверочный режим: поиск по двум мемам. Настоящий RAG ещё не подключён.</p>
         <!-- Сообщения рисует js/chat.js -->
         <div class="chat__inner" id="messages"></div>
       </section>
@@ -134,7 +135,6 @@
   </div>
 
   <!-- Порядок важен: данные → API → общие функции → части интерфейса → запуск -->
-  <script src="js/data.js"></script>
   <script src="js/api.js"></script>
   <script src="js/ui.js"></script>
   <script src="js/chat.js"></script>

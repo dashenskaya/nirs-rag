@@ -1,4 +1,7 @@
 /* ===== Базовые настройки ===== */
+.search-mode { padding: 10px 20px; background: #fbf8c8; color: #4d2d8c; font-size: 14px; text-align: center; }
+.sources { margin-top: 12px; padding: 12px; border: 1px solid #e2e2e7; border-radius: 12px; }
+.sources p { margin-top: 8px; white-space: pre-wrap; }
 :root {
   --bg: #f5f5f7;
   --card: #ffffff;

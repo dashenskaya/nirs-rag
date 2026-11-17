@@ -24,7 +24,7 @@ function plural(n, one, few, many) {
 function avatarHtml(user, size = 'small') {
   const cls = `avatar avatar--${size}`;
   if (user.avatar) {
-    return `<img class="${cls}" src="${user.avatar}" alt="">`;
+    return `<img class="${cls}" src="${escapeHtml(user.avatar)}" alt="">`;
   }
   const letter = (user.nickname || user.login || '?').trim().charAt(0).toUpperCase();
   return `<span class="${cls}" aria-hidden="true">${escapeHtml(letter)}</span>`;

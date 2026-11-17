@@ -27,6 +27,7 @@ function renderProfile() {
 // Любая кнопка с data-open-auth открывает окно входа
 document.addEventListener('click', (event) => {
   if (event.target.closest('[data-open-auth]')) {
+    if (state.loading) return showToast('Дождитесь завершения поиска');
     switchTab('login');
     closeSidebar();
     openModal(authModal);
@@ -107,6 +108,7 @@ async function onSignedIn(user) {
 let pendingAvatar = null; // фото, выбранное в окне, но ещё не сохранённое
 
 function openProfile() {
+  profileForm.hidden = state.user.role === 'admin';
   pendingAvatar = state.user.avatar;
   profileForm.nickname.value = state.user.nickname;
   document.getElementById('profile-login').textContent = state.user.login;
@@ -171,7 +173,9 @@ profileForm.addEventListener('submit', async (event) => {
 
 // Выход: теряем авторизацию, история недоступна, интерфейс — как у гостя
 document.getElementById('logout').addEventListener('click', async () => {
-  await api.logout();
+  if (state.loading) return showToast('Дождитесь завершения поиска');
+  try { await api.logout(); }
+  catch (error) { showToast(error.message); return; }
   state.user = null;
   state.chat = null;
   closeModal(profileModal);

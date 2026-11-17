@@ -51,7 +51,7 @@ function emptyChatHtml() {
     <div class="welcome">
       <img class="welcome__logo" src="images/logo.png" alt="">
       <h2 class="welcome__title">Meme Helper</h2>
-      <p class="welcome__text">Опишите ситуацию, и Meme Helper подберёт 5 подходящих мемов —
+      <p class="welcome__text">Опишите ситуацию, и Meme Helper подберёт до 5 подходящих мемов —
         объяснит, что они значат, и подскажет, что написать.</p>
       <div class="examples">${examples}</div>
     </div>`;
@@ -88,6 +88,12 @@ function messageHtml(message, index) {
       </div>`;
   }
 
+  if (message.answer) body += `<p class="answer">${escapeHtml(message.answer)}</p>`;
+  if (message.sources?.length) {
+    body += `<details class="sources"><summary>Источники (${message.sources.length})</summary>${message.sources.map(
+      (source) => `<p><strong>${escapeHtml(source.id)}</strong>: ${escapeHtml(source.text)}</p>`
+    ).join('')}</details>`;
+  }
   return `<div class="msg msg--bot"><img class="bot-avatar" src="images/logo.png" alt=""><div class="bubble bubble--bot">${body}</div></div>`;
 }
 
@@ -154,7 +160,7 @@ function setLoading(loading) {
 
 // Новый пустой чат (ещё не сохранён, сохранится после первого сообщения)
 function createChat() {
-  return { id: 'chat_' + Date.now(), title: '', updatedAt: Date.now(), messages: [] };
+  return { id: 'chat_' + crypto.randomUUID(), title: '', updatedAt: Date.now(), messages: [] };
 }
 
 async function sendMessage(text) {
@@ -185,10 +191,10 @@ async function sendMessage(text) {
 // Запрос к «ИИ» → сообщение-ответ нужного состояния
 async function ask(query) {
   try {
-    const { results } = await api.searchMemes(query);
+    const { results, answer, sources, mode } = await api.searchMemes(query);
     return results.length
-      ? { role: 'assistant', status: 'success', query, results }
-      : { role: 'assistant', status: 'empty', query };
+      ? { role: 'assistant', status: 'success', query, results, answer, sources, mode }
+      : { role: 'assistant', status: 'empty', query, answer, sources, mode };
   } catch (e) {
     return { role: 'assistant', status: 'error', query };
   }
@@ -210,9 +216,13 @@ async function retry(index) {
 
 // Вошедшему сохраняем чат в историю, гостю — нет
 async function persistChat(chat) {
-  if (!state.user) return;
-  chat.updatedAt = Date.now();
-  await api.saveChat(chat);
+  if (!state.user || state.user.role !== 'user') return;
+  try {
+    const saved = await api.saveChat(chat);
+    chat.updatedAt = saved.updatedAt;
+  } catch (error) {
+    showToast('Чат не сохранён: ' + error.message);
+  }
   renderSidebar();
 }
 

@@ -10,6 +10,10 @@ const sidebarOverlay = document.getElementById('sidebar-overlay');
 
 async function renderSidebar() {
   // Гость: истории нет, предлагаем войти (состояние Unauthorized)
+  if (state.user?.role === 'admin') {
+    sidebarBody.innerHTML = '<p class="sidebar-empty">Администратору доступна аналитика в профиле.</p>';
+    return;
+  }
   if (!state.user) {
     sidebarBody.innerHTML = `
       <div class="sidebar-note">
@@ -20,7 +24,9 @@ async function renderSidebar() {
     return;
   }
 
-  const chats = await api.listChats();
+  let chats;
+  try { chats = await api.listChats(); }
+  catch (error) { sidebarBody.textContent = error.message; return; }
   if (!chats.length) {
     sidebarBody.innerHTML = '<p class="sidebar-empty">Здесь появятся ваши чаты</p>';
     return;
@@ -46,14 +52,16 @@ async function renderSidebar() {
 // Выбор чата: текущий диалог заменяется выбранным, сообщения грузятся из истории
 async function openChat(id) {
   if (state.loading) return;
-  state.chat = await api.getChat(id);
+  try { state.chat = await api.getChat(id); }
+  catch (error) { showToast(error.message); return; }
   renderChat();
   renderSidebar();
   closeSidebar();
 }
 
 async function removeChat(id) {
-  await api.deleteChat(id);
+  try { await api.deleteChat(id); }
+  catch (error) { showToast(error.message); return; }
   if (state.chat?.id === id) {
     state.chat = null;
     renderChat();
