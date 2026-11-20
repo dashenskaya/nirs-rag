@@ -31,6 +31,9 @@ BM25_B = 0.75
 RETRIEVAL_K = 20
 MAX_RESULTS = 5
 MIN_BM25_SCORE = 0.18
+LLM_MAX_RETRIES = 2
+LLM_RETRY_DELAY = 1
+LLM_MAX_TOKENS = int(os.environ.get('LLM_MAX_TOKENS', 3072))
 
 # Варианты одного понятия сводим к каноническому тегу. Это не словарь
 # синонимов, а только орфографически/словообразовательно близкие формы.
@@ -590,6 +593,7 @@ def _build_llm_payload(query: str, candidates: list[dict], stream: bool = False)
         'model': model,
         'temperature': 0.2,
         'response_format': {'type': 'json_object'},
+        'max_tokens': LLM_MAX_TOKENS,
         'messages': [
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': json.dumps({
@@ -599,9 +603,6 @@ def _build_llm_payload(query: str, candidates: list[dict], stream: bool = False)
             }, ensure_ascii=False)},
         ],
     }
-    # Qwen3 — reasoning-модель. Для локального Ollama явно выключаем
-    # thinking через OpenAI-compatible параметр. Иначе некоторые версии
-    # Ollama возвращают пустое message.content, и JSON-парсер не получает ответ.
     if '127.0.0.1' in api_base or 'localhost' in api_base:
         payload['reasoning_effort'] = 'none'
 
@@ -614,66 +615,221 @@ def _build_llm_payload(query: str, candidates: list[dict], stream: bool = False)
     return api_base + '/chat/completions', headers, payload
 
 
-def _parse_llm_content(content: str) -> dict:
+def _parse_llm_content(
+    content: str,
+    debug_label: str = "response"
+) -> dict:
     if not isinstance(content, str):
-        raise RuntimeError('LLM: содержимое ответа должно быть строкой')
+        raise RuntimeError(
+            'LLM: содержимое ответа должно быть строкой'
+        )
+
+    raw_content = content
     content = content.strip()
+
     if content.startswith('```'):
-        content = re.sub(r'^```(?:json)?\s*|\s*```$', '', content, flags=re.IGNORECASE)
+        content = re.sub(
+            r'^```(?:json)?\s*|\s*```$',
+            '',
+            content,
+            flags=re.IGNORECASE
+        )
+
     start, end = content.find('{'), content.rfind('}')
+
     if start < 0 or end < start:
         raise RuntimeError('LLM не вернула JSON-объект')
+
+    json_text = content[start:end + 1]
+
     try:
-        parsed = json.loads(content[start:end + 1])
+        parsed = json.loads(json_text)
+
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f'Некорректный JSON от LLM: {exc}') from exc
-    if not isinstance(parsed, dict) or not isinstance(parsed.get('results'), list):
-        raise RuntimeError('LLM: ожидаются поля answer и results')
+        # Сохраняем полный ответ модели
+        debug_dir = ROOT / 'benchmark' / 'llm_debug'
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_label = re.sub(
+            r'[^\w-]+',
+            '_',
+            debug_label,
+            flags=re.UNICODE
+        )
+
+        debug_path = debug_dir / f'{safe_label}.txt'
+        debug_path.write_text(
+            raw_content,
+            encoding='utf-8'
+        )
+
+        # Показываем фрагмент вокруг ошибки
+        left = max(0, exc.pos - 150)
+        right = min(len(json_text), exc.pos + 150)
+
+        fragment = json_text[left:right]
+        pointer = ' ' * (exc.pos - left) + '^'
+
+        print('\n========== JSON ERROR ==========', flush=True)
+        print(f'Ошибка: {exc}', flush=True)
+        print(f'Позиция: {exc.pos}', flush=True)
+        print(f'Полная длина JSON: {len(json_text)}', flush=True)
+        print(f'Фрагмент: {fragment!r}', flush=True)
+        print(f'            {pointer}', flush=True)
+        print(f'Полный ответ сохранён: {debug_path}', flush=True)
+        print('================================\n', flush=True)
+
+        raise RuntimeError(
+            f'Некорректный JSON от LLM: {exc}. '
+            f'Полный ответ: {debug_path}'
+        ) from exc
+
+    if not isinstance(parsed, dict) or not isinstance(
+        parsed.get('results'), list
+    ):
+        raise RuntimeError(
+            'LLM: ожидаются поля answer и results'
+        )
+
     return parsed
 
 
 def _call_llm(query: str, candidates: list[dict]) -> dict:
     url, headers, payload = _build_llm_payload(query, candidates)
-    request = Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
-        headers=headers,
-        method='POST',
-    )
-    try:
-        with urlopen(request, timeout=180) as response:
-            response_data = json.loads(response.read().decode('utf-8'))
-    except HTTPError as exc:
-        detail = exc.read().decode('utf-8', errors='replace')[:1000]
-        raise RuntimeError(f'LLM вернула HTTP {exc.code}: {detail}') from exc
-    except (URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(f'Не удалось подключиться к LLM: {exc}') from exc
 
-    try:
-        choice = response_data['choices'][0]
-        message = choice['message']
-        content = message.get('content')
-        if isinstance(content, list):
-            content = ''.join(
-                part.get('text', '') for part in content
-                if isinstance(part, dict)
+    for attempt in range(LLM_MAX_RETRIES + 1):
+        request = Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+            headers=headers,
+            method='POST',
+        )
+
+        try:
+            try:
+                with urlopen(request, timeout=240) as response:
+                    response_data = json.loads(
+                        response.read().decode('utf-8')
+                    )
+
+            except HTTPError as exc:
+                detail = exc.read().decode(
+                    'utf-8', errors='replace'
+                )[:1000]
+
+                raise RuntimeError(
+                    f'LLM вернула HTTP {exc.code}: {detail}'
+                ) from exc
+
+            except (URLError, TimeoutError, OSError) as exc:
+                raise RuntimeError(
+                    f'Не удалось подключиться к LLM: {exc}'
+                ) from exc
+
+            try:
+                choice = response_data['choices'][0]
+                message = choice['message']
+                content = message.get('content')
+
+                if isinstance(content, list):
+                    content = ''.join(
+                        part.get('text', '')
+                        for part in content
+                        if isinstance(part, dict)
+                    )
+
+            except (KeyError, IndexError, TypeError) as exc:
+                raise RuntimeError(
+                    f'Некорректный ответ LLM: {exc}'
+                ) from exc
+
+            if not isinstance(content, str) or not content.strip():
+                finish_reason = choice.get('finish_reason')
+
+                raise RuntimeError(
+                    'LLM вернула пустой ответ '
+                    f'(finish_reason={finish_reason!r})'
+                )
+
+            query_label = re.sub(
+                r'[^\w-]+',
+                '_',
+                query,
+                flags=re.UNICODE
+            )[:40]
+
+            try:
+                return _parse_llm_content(
+                    content,
+                    debug_label=f'{query_label}_attempt_{attempt + 1}'
+                )
+            except RuntimeError:
+                finish_reason = choice.get('finish_reason')
+                print(
+                    f"[LLM DEBUG] Finish reason: {finish_reason!r}",
+                    flush=True
+                )
+
+                if finish_reason == 'length':
+                    recovered = _recover_completed_llm_response(
+                        content,
+                        {c['meme']['id']: c['meme'] for c in candidates}
+                    )
+                    if recovered is not None:
+                        return recovered
+                raise
+
+        except RuntimeError as exc:
+            if attempt >= LLM_MAX_RETRIES:
+                print(
+                    '[LLM] Все попытки исчерпаны. '
+                    f'Последняя ошибка: {exc}',
+                    flush=True
+                )
+                raise
+
+            delay = LLM_RETRY_DELAY * (attempt + 1)
+
+            print(
+                f'[LLM] Ошибка на попытке {attempt + 1}. '
+                f'Повтор {attempt + 2}/{LLM_MAX_RETRIES + 1} '
+                f'через {delay} сек. Причина: {exc}',
+                flush=True
             )
-    except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(f'Некорректный ответ LLM: {exc}') from exc
 
-    if not isinstance(content, str) or not content.strip():
-        has_reasoning = bool(
-            message.get('reasoning') or message.get('reasoning_content')
+            time.sleep(delay)
+
+    raise RuntimeError('Не удалось получить ответ от LLM')
+
+def _remove_internal_ids(
+    text: str,
+    allowed: dict[str, dict]
+) -> str:
+    if not isinstance(text, str):
+        return ''
+
+    for meme_id in sorted(
+        allowed.keys(),
+        key=len,
+        reverse=True
+    ):
+        pattern = (
+            r'(?<![A-Za-zА-Яа-яЁё0-9_.-])'
+            + re.escape(meme_id)
+            + r'(?![A-Za-zА-Яа-яЁё0-9_.-])'
         )
-        finish_reason = choice.get('finish_reason')
-        raise RuntimeError(
-            'Ollama вернула пустое message.content ' +
-            f'(finish_reason={finish_reason!r}, reasoning_present={has_reasoning}). ' +
-            'Проверьте поддержку reasoning_effort="none" и обновите Ollama.'
+
+        text = re.sub(
+            pattern,
+            '',
+            text,
+            flags=re.IGNORECASE
         )
 
-    return _parse_llm_content(content)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = re.sub(r'\s+([,.;:!?])', r'\1', text)
 
+    return text.strip()
 
 def _format_model_item(item: dict, allowed: dict[str, dict]) -> dict:
     if not isinstance(item, dict):
@@ -685,6 +841,10 @@ def _format_model_item(item: dict, allowed: dict[str, dict]) -> dict:
 
     why = item.get('why_it_fits')
     example = item.get('example')
+    if isinstance(why, str):
+        why = _remove_internal_ids(why, allowed)
+    if isinstance(example, str):
+        example = _remove_internal_ids(example, allowed)
     if not isinstance(why, str) or not why.strip() or len(why) > 2000:
         raise RuntimeError('LLM: why_it_fits должно содержать текст до 2000 символов')
     if not isinstance(example, str) or not example.strip() or len(example) > 1000:
@@ -709,30 +869,132 @@ def _format_model_item(item: dict, allowed: dict[str, dict]) -> dict:
         'suggestion': example.strip(),
     }
 
+def _recover_completed_llm_response(
+    content: str,
+    allowed: dict[str, dict]
+) -> dict | None:
+    """
+    Восстанавливает полностью сформированные результаты
+    из JSON, который модель не успела завершить.
+    """
 
-def _build_search_response(candidates: list[dict], llm_result: dict, sources: list[dict]) -> dict:
+    parser = _IncrementalJSONParser()
+    events = parser.feed(content)
+
+    answer = ''
+    results = []
+    seen = set()
+
+    for event_type, value in events:
+        if event_type == 'answer':
+            if isinstance(value, str):
+                answer = value
+
+        elif event_type == 'result':
+            try:
+                formatted = _format_model_item(value, allowed)
+            except RuntimeError as exc:
+                print(
+                    f'[LLM RECOVERY] Пропущен некорректный мем: {exc}',
+                    flush=True
+                )
+                continue
+
+            meme_id = formatted['meme']['id']
+
+            if meme_id in seen:
+                continue
+
+            seen.add(meme_id)
+            results.append(value)
+
+            if len(results) >= MAX_RESULTS:
+                break
+
+    if not results:
+        return None
+
+    print(
+        f'[LLM RECOVERY] Восстановлено мемов: {len(results)}',
+        flush=True
+    )
+
+    return {
+        'answer': answer.strip() or (
+            'Генерация завершилась раньше времени. '
+            'Показываю уже найденные мемы.'
+        ),
+        'results': results,
+    }
+
+def _build_search_response(
+    candidates: list[dict],
+    llm_result: dict,
+    sources: list[dict]
+) -> dict:
     model_items = llm_result['results']
-    if len(model_items) > MAX_RESULTS:
-        raise RuntimeError('LLM вернула больше пяти мемов')
 
-    allowed = {candidate['meme']['id']: candidate['meme'] for candidate in candidates}
+    allowed = {
+        candidate['meme']['id']: candidate['meme']
+        for candidate in candidates
+    }
+
     seen = set()
     results = []
+
     for item in model_items:
-        result = _format_model_item(item, allowed)
+        # Не больше MAX_RESULTS результатов.
+        if len(results) >= MAX_RESULTS:
+            break
+
+        try:
+            result = _format_model_item(item, allowed)
+
+        except RuntimeError as exc:
+            meme_id = (
+                item.get('id')
+                if isinstance(item, dict)
+                else None
+            )
+
+            print(
+                f'[LLM] Пропускаю некорректный результат: '
+                f'id={meme_id!r}; причина: {exc}. '
+                f'Допустимые ID: {list(allowed.keys())}',
+                flush=True
+            )
+            continue
+
         meme_id = result['meme']['id']
+
         if meme_id in seen:
-            raise RuntimeError('LLM вернула повторяющийся id')
+            print(
+                f'[LLM] Пропускаю повторный мем: {meme_id}',
+                flush=True
+            )
+            continue
+
         seen.add(meme_id)
         results.append(result)
 
     answer = llm_result.get('answer', '')
-    if not isinstance(answer, str):
-        raise RuntimeError('LLM: answer должен быть строкой')
-    if not answer.strip():
-        answer = 'Подходящие мемы не найдены.' if not results else 'Подобраны мемы для вашей ситуации.'
 
-    return {'results': results, 'answer': answer.strip(), 'sources': sources}
+    if not isinstance(answer, str):
+        answer = ''
+
+    answer = answer.strip()
+
+    if not answer:
+        if results:
+            answer = 'Подобраны мемы для вашей ситуации.'
+        else:
+            answer = 'Подходящие мемы не найдены.'
+
+    return {
+        'results': results,
+        'answer': answer,
+        'sources': sources
+    }
 
 
 def _call_llm_stream(query: str, candidates: list[dict], on_event=None) -> dict:
@@ -815,7 +1077,41 @@ def _call_llm_stream(query: str, candidates: list[dict], on_event=None) -> dict:
         raise RuntimeError(
             f'LLM завершила поток без содержимого ответа (finish_reason={finish_reason!r})'
         )
-    return _parse_llm_content(content)
+    try:
+        return _parse_llm_content(content)
+
+    except RuntimeError:
+        if finish_reason == 'length':
+            recovered = _recover_completed_llm_response(
+                content,
+                allowed
+            )
+
+            if recovered is not None:
+                print(
+                    '[LLM STREAM] Генерация оборвалась. '
+                    'Возвращаем уже сформированные мемы.',
+                    flush=True
+                )
+                return recovered
+
+            # Даже если ни один мем не удалось восстановить,
+            # не отправляем ошибку сервера из-за оборванного JSON.
+            print(
+                '[LLM STREAM] JSON оборван до формирования '
+                'полного результата.',
+                flush=True
+            )
+
+            return {
+                'answer': (
+                    'Не удалось завершить подбор мемов. '
+                    'Попробуйте повторить запрос.'
+                ),
+                'results': [],
+            }
+
+        raise
 
 
 def _build_sources(candidates: list[dict]) -> list[dict]:

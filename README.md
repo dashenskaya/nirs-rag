@@ -95,6 +95,14 @@ cd C:\nirs\nirs-rag
 Проверяются регистрация, сессии, пароли, изоляция чатов, профиль, права админа, поиск,
 учёт ошибок, скрытие запросов, защита служебных файлов, подключение RAG, BM25 и формулы метрик.
 
+## Как проверить бенчмарки
+
+Достаточно ввести эту команду:
+
+.\.venv\Scripts\python.exe -m benchmark.run .\benchmark\dataset.json --k 3 --review .\benchmark\review.json --output .\benchmark\results-v2.json
+
+все бенчмарки лежат в файле bencmark/dataset.json, а все результаты в benchmark/result-v2.json
+
 ## Настройка RAG: pymorphy3, BM25, LLM и MinIO
 
 По умолчанию `run.py` подключает `app.backend.meme_rag:search`. Зависимости из `requirements.txt` устанавливаются автоматически при запуске через `start.cmd`.
@@ -215,8 +223,6 @@ fetch('/api/admin/memes', {
 - сохранённая выдача и ответы; Recall@k, MRR, Accuracy, Correct Rejection Rate;
 - краткий разбор ошибок и инструкция воспроизведения.
 
-Требования к самостоятельной реализации индекса указаны в методичке, раздел 2, с. 8.
-Инструкция по бенчмарку: [benchmark/README.md](benchmark/README.md).
 
 ## Файлы проекта
 

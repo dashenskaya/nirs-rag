@@ -7,6 +7,7 @@ from pathlib import Path
 from statistics import mean
 
 from app.backend.rag import SearchProvider
+from app.backend.config import load_env_file
 
 
 def evaluate(dataset, provider, k=3, review=None):
@@ -32,6 +33,11 @@ def evaluate(dataset, provider, k=3, review=None):
             raise ValueError('У каждого вопроса нужен text')
         if not relevant.issubset(ids) or (question.get('trap') and relevant) or (not question.get('trap') and len(relevant) < 3):
             raise ValueError('Обычный вопрос: минимум 3 релевантных ID; ловушка: пустой relevant_ids')
+        print(
+            f"\n[BENCHMARK] {question['id']}: "
+            f"{question['text']}",
+            flush=True
+        )
         response = provider.search(question['text'])
         ranked = list(dict.fromkeys(s['id'] for s in response['sources']))[:k]
         if any(doc_id not in ids for doc_id in ranked):
@@ -57,6 +63,7 @@ def evaluate(dataset, provider, k=3, review=None):
 
 
 def main():
+    load_env_file()
     parser = argparse.ArgumentParser(description='Проверка RAG по требованиям контрольной точки')
     parser.add_argument('dataset', type=Path)
     parser.add_argument('--k', type=int, default=3)
