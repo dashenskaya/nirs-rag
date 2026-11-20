@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .rag import SearchProvider
+from .migrations import apply_migrations
 
 ROOT = Path(__file__).resolve().parents[2]
 WEB = ROOT / 'app' / 'MemeHelper'
@@ -49,31 +50,18 @@ def public_user(row):
 class Database:
     def __init__(self, path):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as db:
-            db.executescript('''
-            PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS users (
-                login TEXT PRIMARY KEY, nickname TEXT NOT NULL, avatar TEXT,
-                password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user');
-            CREATE TABLE IF NOT EXISTS sessions (
-                token TEXT PRIMARY KEY, login TEXT NOT NULL REFERENCES users(login), expires REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS chats (
-                id TEXT PRIMARY KEY, login TEXT NOT NULL REFERENCES users(login),
-                title TEXT NOT NULL, updated_at INTEGER NOT NULL, messages TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS memes (id TEXT PRIMARY KEY, data TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS events (
-                id TEXT PRIMARY KEY, query TEXT NOT NULL, status TEXT NOT NULL,
-                at INTEGER NOT NULL, who TEXT NOT NULL, meme_ids TEXT NOT NULL, hidden INTEGER NOT NULL DEFAULT 0);
-            CREATE INDEX IF NOT EXISTS events_at ON events(at);
-            CREATE INDEX IF NOT EXISTS chats_owner ON chats(login);
-            ''')
+        self.path.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+        apply_migrations(self.path)
 
     @contextmanager
     def connect(self):
         db = sqlite3.connect(self.path, timeout=15)
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA foreign_keys=ON')
+
         try:
             with db:
                 yield db
@@ -81,11 +69,26 @@ class Database:
             db.close()
 
     def create_admin(self, login, password):
-        if not re.fullmatch(r'[a-z0-9_.-]{3,20}', login) or not 6 <= len(password) <= 128:
-            raise ValueError('Логин: 3–20 символов a-z, 0-9, _, ., -; пароль: 6–128 символов')
+        if (
+            not re.fullmatch(r'[a-z0-9_.-]{3,20}', login)
+            or not 6 <= len(password) <= 128
+        ):
+            raise ValueError(
+                'Логин: 3–20 символов a-z, 0-9, _, ., -; '
+                'пароль: 6–128 символов'
+            )
+
         with self.connect() as db:
-            db.execute('INSERT INTO users(login,nickname,password_hash,role) VALUES(?,?,?,?)',
-                       (login, 'Администратор', password_hash(password), 'admin'))
+            db.execute(
+                'INSERT INTO users(login,nickname,password_hash,role) '
+                'VALUES(?,?,?,?)',
+                (
+                    login,
+                    'Администратор',
+                    password_hash(password),
+                    'admin'
+                )
+            )
 
 
 class Server(ThreadingHTTPServer):
@@ -94,11 +97,24 @@ class Server(ThreadingHTTPServer):
     def __init__(self, address, db_path, provider=None):
         self.database = Database(db_path)
         self.provider = provider or SearchProvider()
+
         with self.database.connect() as db:
-            # При подключении RAG каталог должен описывать его базу, не демо-мемы.
-            # Старые записи сохраняются как история ранее показанных мемов.
+            # При подключении RAG каталог должен описывать его базу,
+            # не демо-мемы. Старые записи сохраняются.
             for meme in self.provider.catalog:
-                db.execute('INSERT OR IGNORE INTO memes VALUES(?,?)', (meme['id'], json.dumps(meme, ensure_ascii=False)))
+                db.execute(
+                    '''
+                    INSERT INTO memes(id, data)
+                    VALUES(?, ?)
+                    ON CONFLICT(id)
+                    DO UPDATE SET data = excluded.data
+                    ''',
+                    (
+                        meme['id'],
+                        json.dumps(meme, ensure_ascii=False)
+                    )
+                )
+
         super().__init__(address, Handler)
 
 
@@ -137,10 +153,43 @@ class Handler(BaseHTTPRequestHandler):
                 if self.command != 'GET':
                     raise APIError(405, 'Метод не поддерживается')
                 return self.static()
+            # Выдача изображения по постоянному адресу приложения.
+            # image_key и временная ссылка MinIO в JSON чата не сохраняются.
+
+            image_match = re.fullmatch(
+                r'/api/memes/([A-Za-z0-9._-]{1,100})/image',
+                self.route
+            )
+
+            if image_match and self.command == 'GET':
+
+                try:
+                    location = self.server.provider.get_image_url(
+                        image_match.group(1)
+                    )
+
+                except LookupError:
+                    raise APIError(
+                        404,
+                        'Мем или его изображение не найдены'
+                    )
+
+                except Exception:
+                    traceback.print_exc()
+
+                    raise APIError(
+                        502,
+                        'Не удалось получить изображение из MinIO'
+                    )
+
+                return self.redirect(location)
             data = self.read_json() if self.command in ('POST', 'PATCH', 'PUT') else {}
             with self.server.database.connect() as db:
                 self.db = db
                 self.user = self.current_user()
+                if self.route == '/api/search/stream' and self.command == 'POST':
+                    self.handle_stream_search(data)
+                    return
                 result = self.dispatch(data)
             self.respond(200, result)
         except APIError as error:
@@ -190,6 +239,103 @@ class Handler(BaseHTTPRequestHandler):
         self.db.execute('INSERT INTO sessions VALUES(?,?,?)',
                         (hashlib.sha256(token.encode()).hexdigest(), login, time.time() + SESSION_AGE))
         self.cookie('meme_session', token)
+
+    def _send_sse_event(self, event, payload):
+        """Отправляет одно событие Server-Sent Events клиенту."""
+        body = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False
+        )
+        frame = f'event: {event}\ndata: {body}\n\n'.encode('utf-8')
+        self.wfile.write(frame)
+        self.wfile.flush()
+
+    def handle_stream_search(self, data):
+        """Потоковый HTTP endpoint поиска; история чата не передаётся в RAG."""
+        # Проверяем запрос до отправки SSE-заголовков, чтобы ошибки валидации
+        # возвращались обычным JSON-ответом с корректным HTTP-статусом.
+        query = text(data, 'query', 1, 1000)
+        who = (
+            'user:' + self.user['login']
+            if self.user
+            else self.guest()
+        )
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+        self.send_header('Cache-Control', 'no-cache, no-transform')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Accel-Buffering', 'no')
+        for cookie in self.cookies_out:
+            self.send_header('Set-Cookie', cookie)
+        self.end_headers()
+
+        def emit(event, payload):
+            # Клиент использует только эти типы событий. Не принимаем
+            # произвольные имена событий от подключённого RAG-провайдера.
+            if event not in {'status', 'answer', 'result'}:
+                return
+            self._send_sse_event(event, payload)
+
+        try:
+            emit('status', {'message': 'Ищу подходящие мемы…'})
+            response = self.server.provider.stream_search(
+                query,
+                on_event=emit
+            )
+            status = 'success' if response['results'] else 'empty'
+            ids = list(dict.fromkeys(
+                item['meme']['id'] for item in response['results']
+            ))
+
+            if response['results']:
+                for item in response['results']:
+                    self.db.execute(
+                        'INSERT OR REPLACE INTO memes VALUES(?,?)',
+                        (
+                            item['meme']['id'],
+                            json.dumps(item['meme'], ensure_ascii=False)
+                        )
+                    )
+
+            self.db.execute(
+                'INSERT INTO events(id,query,status,at,who,meme_ids) VALUES(?,?,?,?,?,?)',
+                (
+                    secrets.token_hex(16),
+                    query,
+                    status,
+                    int(time.time() * 1000),
+                    who,
+                    json.dumps(ids)
+                )
+            )
+            self._send_sse_event('done', response)
+
+        except (BrokenPipeError, ConnectionResetError):
+            # Клиент закрыл вкладку или отменил запрос. Не пытаемся
+            # отправить второй HTTP-ответ в уже закрытое соединение.
+            return
+        except Exception:
+            traceback.print_exc()
+            self.db.execute(
+                'INSERT INTO events(id,query,status,at,who,meme_ids) VALUES(?,?,?,?,?,?)',
+                (
+                    secrets.token_hex(16),
+                    query,
+                    'error',
+                    int(time.time() * 1000),
+                    who,
+                    '[]'
+                )
+            )
+            try:
+                self._send_sse_event(
+                    'error',
+                    {'error': 'Не удалось получить ответ от модуля поиска'}
+                )
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
     def dispatch(self, data):
         route, method = self.route, self.command
@@ -300,7 +446,7 @@ class Handler(BaseHTTPRequestHandler):
             return response
         if route.startswith('/api/admin/'):
             self.require('admin')
-            return self.admin(route, method)
+            return self.admin(route, method, data)
         raise APIError(404, 'Адрес API не найден или метод не поддерживается')
 
     def guest(self):
@@ -310,7 +456,47 @@ class Handler(BaseHTTPRequestHandler):
             self.cookie('meme_guest', value, 365 * 86400)
         return 'guest:' + value
 
-    def admin(self, route, method):
+    def admin(self, route, method, data=None):
+        if route == '/api/admin/memes' and method == 'POST':
+            meme_id = text(data, 'id', 1, 100)
+            name = text(data, 'name', 1, 200)
+            description = text(data, 'description', 1, 8000)
+            image_key = text(data, 'image_key', 1, 1024)
+            history = data.get('history', '')
+            tags = data.get('tags', [])
+            if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
+                raise APIError(400, 'Поле tags должно быть списком строк')
+            if not isinstance(history, str) or len(history.strip()) > 8000:
+                raise APIError(
+                    400,
+                    'Поле history должно содержать не более 8000 символов'
+                )
+            try:
+                saved = self.server.provider.add_meme(
+                    meme_id=meme_id,
+                    name=name,
+                    description=description,
+                    history=history.strip(),
+                    image_key=image_key,
+                    tags=tags,
+                )
+            except ValueError as error:
+                raise APIError(400, str(error))
+            except RuntimeError as error:
+                raise APIError(503, str(error))
+            # Обновляем служебный каталог для существующей аналитики.
+            for item in self.server.provider.catalog:
+                self.db.execute(
+                    'INSERT OR REPLACE INTO memes VALUES(?,?)',
+                    (
+                        item['id'],
+                        json.dumps(item, ensure_ascii=False)
+                    )
+                )
+            return {
+                'ok': True,
+                'meme': saved
+            }
         if route == '/api/admin/stats' and method == 'GET':
             period = self.params.get('period', ['week'])[0]
             if period not in ('day', 'week'):
@@ -342,6 +528,27 @@ class Handler(BaseHTTPRequestHandler):
                 raise APIError(404, 'Запись не найдена')
             return {'ok': True}
         raise APIError(404, 'Адрес API не найден')
+
+
+    def redirect(self, location):
+        self.send_response(302)
+        self.send_header(
+            'Location',
+            location
+        )
+        self.send_header(
+            'Cache-Control',
+            'no-store'
+        )
+        self.send_header(
+            'X-Content-Type-Options',
+            'nosniff'
+        )
+        self.send_header(
+            'Content-Length',
+            '0'
+        )
+        self.end_headers()
 
     def respond(self, status, value):
         body = json.dumps(value, ensure_ascii=False, allow_nan=False).encode('utf-8')

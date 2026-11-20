@@ -1,0 +1,29 @@
+
+services:
+  minio:
+    container_name: memehelper-minio
+    image: docker.io/pgsty/silo:RELEASE.2026-11-09T00-00-00Z
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?Set MINIO_ACCESS_KEY in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?Set MINIO_SECRET_KEY in .env}
+    volumes:
+      - ./var/minio:/data
+
+  ollama:
+    profiles:
+      - local-llm
+    image: ollama/ollama:latest
+    command: serve
+    container_name: memehelper-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    volumes:
+      - ./var/ollama:/root/.ollama

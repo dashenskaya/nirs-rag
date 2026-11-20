@@ -103,6 +103,47 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(admin.call('/api/chats')[0], 403)
         self.assertEqual(admin.call('/api/me', 'PATCH', {'nickname': 'X', 'avatar': None})[0], 403)
 
+    def test_stream_search_endpoint_emits_sse_and_logs_event(self):
+        status, raw = self.client.call(
+            '/api/search/stream',
+            'POST',
+            {'query': 'смешная шутка'}
+        )
+
+        self.assertEqual(status, 200)
+        stream = raw.decode('utf-8')
+        self.assertIn('event: status', stream)
+        self.assertIn('event: answer', stream)
+        self.assertIn('event: result', stream)
+        self.assertIn('event: done', stream)
+
+        done_frame = next(
+            frame for frame in stream.split('\n\n')
+            if frame.startswith('event: done\n')
+        )
+        payload = json.loads(
+            next(line[5:] for line in done_frame.splitlines() if line.startswith('data:'))
+        )
+        self.assertEqual(payload['mode'], 'demo')
+        self.assertTrue(payload['results'])
+
+        with self.server.database.connect() as db:
+            event = db.execute(
+                'SELECT query,status,meme_ids FROM events ORDER BY at DESC LIMIT 1'
+            ).fetchone()
+        self.assertEqual(event['query'], 'смешная шутка')
+        self.assertEqual(event['status'], 'success')
+        self.assertTrue(json.loads(event['meme_ids']))
+
+    def test_stream_search_endpoint_validates_query_before_starting_stream(self):
+        status, value = self.client.call(
+            '/api/search/stream',
+            'POST',
+            {'query': ' '}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn('error', value)
+
     def test_search_events_and_admin_statistics(self):
         self.assertEqual(self.client.call('/api/search', 'POST', {'query': 'смешная шутка'})[1]['mode'], 'demo')
         self.assertEqual(self.client.call('/api/search', 'POST', {'query': 'абракадабра'})[1]['results'], [])
